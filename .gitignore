@@ -1,0 +1,26 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Database dumps
+*.db
+*.sqlite
+
+# Secrets
+secrets/
