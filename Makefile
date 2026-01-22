@@ -10,7 +10,8 @@ seed:
 	./scripts/seed_dev.sh
 
 run:
-	cargo run
+	cargo run --bin DCMS-Rust-Server
+
 
 check:
 	cargo check
