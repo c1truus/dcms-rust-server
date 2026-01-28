@@ -29,7 +29,7 @@ echo "[git] Adding all changes..."
 git add -A
 
 # Commit message (auto + timestamp)
-COMMIT_MSG="feat(auth): session extensions, impersonation, tests, fixes ($(date '+%Y-%m-%d %H:%M'))"
+COMMIT_MSG="Updated ($(date '+%Y-%m-%d %H:%M'))"
 
 echo
 echo "[git] Committing with message:"
