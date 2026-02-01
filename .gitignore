@@ -20,7 +20,8 @@ Thumbs.db
 
 # Database dumps
 *.db
-*.sqlite
+# *.sqlite
 
 # Secrets
 secrets/
+``

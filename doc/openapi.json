@@ -1,0 +1,269 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "DCMS Server API",
+    "description": "Dental Clinic Management System (DCMS) backend API",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080/api/v1",
+      "description": "Local development"
+    }
+  ],
+  "security": [
+    {
+      "BearerAuth": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Unauthorized"
+      },
+      "Forbidden": {
+        "description": "Forbidden"
+      }
+    }
+  },
+  "paths": {
+    "/auth/login": {
+      "post": {
+        "summary": "Staff login",
+        "tags": ["Auth"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                  "username": { "type": "string" },
+                  "password": { "type": "string" },
+                  "device_name": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Login success" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+
+    "/auth/patient/login": {
+      "post": {
+        "summary": "Patient login",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "Login success" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+
+    "/auth/me": {
+      "get": {
+        "summary": "Get current user",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "Current user info" }
+        }
+      }
+    },
+
+    "/auth/logout": {
+      "post": {
+        "summary": "Logout current session",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "Logged out" }
+        }
+      }
+    },
+
+    "/auth/sessions": {
+      "get": {
+        "summary": "List user sessions",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "Session list" }
+        }
+      }
+    },
+
+    "/auth/sessions/{session_id}": {
+      "get": {
+        "summary": "Inspect session",
+        "tags": ["Auth"],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Session info" }
+        }
+      }
+    },
+
+    "/auth/sessions/{session_id}/revoke": {
+      "post": {
+        "summary": "Revoke one session",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "Session revoked" }
+        }
+      }
+    },
+
+    "/auth/sessions/revoke_all": {
+      "post": {
+        "summary": "Revoke all sessions",
+        "tags": ["Auth"],
+        "responses": {
+          "200": { "description": "All sessions revoked" }
+        }
+      }
+    },
+
+    "/auth/impersonate/{user_id}": {
+      "post": {
+        "summary": "Admin impersonate user",
+        "tags": ["Auth"],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Impersonation token" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+
+    "/clinic": {
+      "get": {
+        "summary": "Get clinic profile",
+        "tags": ["Clinic"],
+        "responses": {
+          "200": { "description": "Clinic profile" }
+        }
+      },
+      "patch": {
+        "summary": "Update clinic profile (admin only)",
+        "tags": ["Clinic"],
+        "responses": {
+          "200": { "description": "Updated clinic profile" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+
+    "/clinic/settings": {
+      "get": {
+        "summary": "Get clinic settings",
+        "tags": ["Clinic"],
+        "responses": {
+          "200": { "description": "Clinic settings" }
+        }
+      },
+      "patch": {
+        "summary": "Update clinic settings (admin only)",
+        "tags": ["Clinic"],
+        "responses": {
+          "200": { "description": "Updated clinic settings" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+
+    "/clinic/meta": {
+      "get": {
+        "summary": "Get clinic UI metadata",
+        "tags": ["Clinic"],
+        "responses": {
+          "200": { "description": "Clinic meta info" }
+        }
+      }
+    },
+
+    "/patients": {
+      "get": {
+        "summary": "List/search patients",
+        "tags": ["Patients"],
+        "responses": {
+          "200": { "description": "Patient list" }
+        }
+      },
+      "post": {
+        "summary": "Create patient",
+        "tags": ["Patients"],
+        "responses": {
+          "200": { "description": "Patient created" }
+        }
+      }
+    },
+
+    "/patients/{patient_id}": {
+      "get": {
+        "summary": "Get patient",
+        "tags": ["Patients"],
+        "responses": {
+          "200": { "description": "Patient info" }
+        }
+      },
+      "patch": {
+        "summary": "Update patient",
+        "tags": ["Patients"],
+        "responses": {
+          "200": { "description": "Patient updated" }
+        }
+      }
+    },
+
+    "/services": {
+      "get": {
+        "summary": "List service catalog",
+        "tags": ["Services"],
+        "responses": {
+          "200": { "description": "Service list" }
+        }
+      }
+    },
+
+    "/users": {
+      "get": {
+        "summary": "List users (admin)",
+        "tags": ["Users"],
+        "responses": {
+          "200": { "description": "User list" }
+        }
+      }
+    }
+  },
+  "tags": [
+    { "name": "Auth" },
+    { "name": "Clinic" },
+    { "name": "Users" },
+    { "name": "Patients" },
+    { "name": "Services" }
+  ]
+}

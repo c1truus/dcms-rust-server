@@ -6,7 +6,7 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8080/api/v1}"
 USERNAME="${USERNAME:-admin}"
 PASSWORD="${PASSWORD:-admin123}"
 
-# If you have a patient user in seeds, you can override:
+# If you have a patient user in seeds, you can override: 
 PATIENT_USERNAME="${PATIENT_USERNAME:-}"
 PATIENT_PASSWORD="${PATIENT_PASSWORD:-}"
 
