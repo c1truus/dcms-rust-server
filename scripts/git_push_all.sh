@@ -28,12 +28,21 @@ echo
 echo "[git] Adding all changes..."
 git add -A
 
-# Commit message (auto + timestamp)
-COMMIT_MSG="Updated ($(date '+%Y-%m-%d %H:%M'))"
-
+# Get commit message
 echo
-echo "[git] Committing with message:"
+read -p "[git] Enter commit message (press Enter for default): " custom_msg
+
+if [[ -z "$custom_msg" ]]; then
+  COMMIT_MSG="Updated ($(date '+%Y-%m-%d %H:%M'))"
+  echo "[git] Using default message:"
+else
+  COMMIT_MSG="$custom_msg"
+  echo "[git] Using custom message:"
+fi
+
 echo "  $COMMIT_MSG"
+
+# Commit
 git commit -m "$COMMIT_MSG" || {
   echo "[git] Nothing to commit."
   exit 0

@@ -7,7 +7,6 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-// use serde_json::Value as JsonValue;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -54,25 +53,23 @@ fn ensure_manage(auth: &AuthContext) -> Result<(), ApiError> {
     }
 }
 
-fn ensure_view_doctor_scope(auth: &AuthContext, requested_doctor: Option<Uuid>) -> Result<Option<Uuid>, ApiError> {
-    // If a doctor requests schedule without specifying doctor_employee_id:
-    // we resolve it from their linked employee record.
-    // If they specify another doctor id, forbid.
-    //
-    // If admin/manager/receptionist: allow any doctor id (or none = all, but we won’t support “all” in week view).
+fn ensure_view_doctor_scope(
+    auth: &AuthContext,
+    requested_doctor: Option<Uuid>,
+) -> Result<Option<Uuid>, ApiError> {
+    // admin/manager/receptionist: allow specifying doctor id (or none, but in our schedule endpoints we may require it)
     if can_manage_appointments(auth) {
         return Ok(requested_doctor);
     }
 
+    // doctor: only self; must not specify doctor_employee_id explicitly (to avoid leaking others)
     if is_doctor(auth) {
         if requested_doctor.is_some() {
-            // doctors may only view themselves
             return Err(ApiError::Forbidden(
                 "FORBIDDEN",
                 "Doctor can only view their own schedule".into(),
             ));
         }
-        // doctor with None -> caller will look up employee_id by auth.user_id
         return Ok(None);
     }
 
@@ -82,10 +79,7 @@ fn ensure_view_doctor_scope(auth: &AuthContext, requested_doctor: Option<Uuid>) 
     ))
 }
 
-async fn resolve_doctor_employee_id_by_user_id(
-    state: &AppState,
-    user_id: Uuid,
-) -> Result<Uuid, ApiError> {
+async fn resolve_doctor_employee_id_by_user_id(state: &AppState, user_id: Uuid) -> Result<Uuid, ApiError> {
     let row = sqlx::query(
         r#"
         SELECT employee_id
@@ -113,15 +107,24 @@ async fn resolve_doctor_employee_id_by_user_id(
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        // schedule views
         .route("/appointments/week", get(get_appointments_week))
+        .route("/appointments/day", get(get_appointments_day))
         .route("/appointments/today", get(get_appointments_today))
+        .route("/appointments/overdue", get(get_appointments_overdue))
+        // CRUD
         .route("/appointments/{appointment_id}", get(get_appointment))
         .route("/appointments", post(create_appointment))
         .route("/appointments/{appointment_id}", patch(patch_appointment))
+        // status transitions
         .route("/appointments/{appointment_id}/arrive", post(mark_arrived))
         .route("/appointments/{appointment_id}/seat", post(mark_seated))
         .route("/appointments/{appointment_id}/dismiss", post(mark_dismissed))
+        // plan items
         .route("/appointments/{appointment_id}/plan_items", put(put_plan_items))
+        // confirmation/reminder
+        .route("/appointments/{appointment_id}/confirm", post(mark_confirmed))
+        .route("/appointments/{appointment_id}/reminder_sent", post(mark_reminder_sent))
 }
 
 /* ============================================================
@@ -156,8 +159,15 @@ pub struct AppointmentBlockDto {
     pub priority: i16,
     pub color_override: Option<i32>,
     pub note: Option<String>,
+
+    // Phase-1 add-ons (from migrations 014; if you didn't add confirmed/reminder columns, remove them)
+    pub source: String,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    pub reminder_sent_at: Option<DateTime<Utc>>,
+
     pub patient: PersonBrief,
     pub doctor: PersonBrief,
+
     pub planned_items: Vec<AppointmentPlanItemDto>,
     pub planned_summary: String,
 }
@@ -168,15 +178,104 @@ pub struct AppointmentBlockDto {
 
 #[derive(Debug, Deserialize)]
 pub struct WeekQuery {
-    // YYYY-MM-DD (local interpretation belongs to frontend; DB stores timestamptz)
-    pub start: String,
-    pub days: Option<i64>,
+    pub start: String,              // YYYY-MM-DD
+    pub days: Option<i64>,          // default 7
+    pub doctor_employee_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DayQuery {
+    pub date: String,               // YYYY-MM-DD
     pub doctor_employee_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TodayQuery {
     pub doctor_employee_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OverdueQuery {
+    pub doctor_employee_id: Option<Uuid>,
+    pub within_days: Option<i64>,   // default 30
+}
+
+/* ============================================================
+   Shared fetch helper
+   ============================================================ */
+
+async fn fetch_blocks_in_range(
+    state: &AppState,
+    doctor_employee_id: Uuid,
+    start_ts: DateTime<Utc>,
+    end_ts: DateTime<Utc>,
+    extra_where_sql: Option<&'static str>,
+    extra_bind: Option<i64>,
+) -> Result<Vec<AppointmentBlockDto>, ApiError> {
+    // NOTE: we bind doctor_id, start_ts, end_ts, then optionally extra_bind if extra_where_sql uses $4.
+    let mut sql = String::from(
+        r#"
+        SELECT
+          a.appointment_id,
+          a.start_at,
+          a.end_at,
+          a.status,
+          a.priority,
+          a.color_override,
+          a.note,
+          a.source,
+          a.confirmed_at,
+          a.reminder_sent_at,
+
+          p.patient_id,
+          p.first_name AS p_first,
+          p.last_name  AS p_last,
+          p.register_number AS p_reg,
+
+          d.employee_id AS d_id,
+          d.employee_display_number AS d_no,
+          d.first_name AS d_first,
+          d.last_name  AS d_last,
+
+          api.service_id AS svc_id,
+          api.qty AS svc_qty,
+          sc.display_name AS svc_name,
+          sc.display_number AS svc_no
+
+        FROM appointment a
+        JOIN patient p ON p.patient_id = a.patient_id
+        JOIN employee d ON d.employee_id = a.doctor_employee_id
+        LEFT JOIN appointment_plan_item api ON api.appointment_id = a.appointment_id
+        LEFT JOIN service_catalog sc ON sc.service_id = api.service_id
+
+        WHERE a.doctor_employee_id = $1
+          AND a.start_at >= $2
+          AND a.start_at <  $3
+        "#,
+    );
+
+    if let Some(extra) = extra_where_sql {
+        sql.push_str("\n  AND ");
+        sql.push_str(extra);
+    }
+
+    sql.push_str("\n ORDER BY a.start_at ASC, sc.display_number ASC\n");
+
+    let mut q = sqlx::query(&sql)
+        .bind(doctor_employee_id)
+        .bind(start_ts)
+        .bind(end_ts);
+
+    if let Some(v) = extra_bind {
+        q = q.bind(v);
+    }
+
+    let rows = q
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
+
+    fold_rows_into_blocks(rows)
 }
 
 /* ============================================================
@@ -190,26 +289,19 @@ pub async fn get_appointments_week(
 ) -> Result<Json<ApiOk<Vec<AppointmentBlockDto>>>, ApiError> {
     let days = q.days.unwrap_or(7);
     if !(1..=14).contains(&days) {
-        return Err(ApiError::BadRequest(
-            "VALIDATION_ERROR",
-            "days must be between 1 and 14".into(),
-        ));
+        return Err(ApiError::BadRequest("VALIDATION_ERROR", "days must be between 1 and 14".into()));
     }
 
-    let start_date = NaiveDate::parse_from_str(q.start.trim(), "%Y-%m-%d").map_err(|_| {
-        ApiError::BadRequest("VALIDATION_ERROR", "start must be YYYY-MM-DD".into())
-    })?;
+    let start_date = NaiveDate::parse_from_str(q.start.trim(), "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("VALIDATION_ERROR", "start must be YYYY-MM-DD".into()))?;
 
     let requested = ensure_view_doctor_scope(&auth, q.doctor_employee_id)?;
-
     let doctor_employee_id = match requested {
         Some(id) => id,
         None => {
-            // doctor self
             if is_doctor(&auth) {
                 resolve_doctor_employee_id_by_user_id(&state, auth.user_id).await?
             } else {
-                // If admin/manager/receptionist omitted doctor id, we force them to provide one
                 return Err(ApiError::BadRequest(
                     "VALIDATION_ERROR",
                     "doctor_employee_id is required for non-doctor users".into(),
@@ -218,59 +310,47 @@ pub async fn get_appointments_week(
         }
     };
 
-    // Range: [start, start+days)
-    let start_ts = DateTime::<Utc>::from_naive_utc_and_offset(start_date.and_hms_opt(0, 0, 0).unwrap(), Utc);
+    let start_ts =
+        DateTime::<Utc>::from_naive_utc_and_offset(start_date.and_hms_opt(0, 0, 0).unwrap(), Utc);
     let end_ts = start_ts + chrono::Duration::days(days);
 
-    let rows = sqlx::query(
-        r#"
-        SELECT
-          a.appointment_id,
-          a.start_at,
-          a.end_at,
-          a.status,
-          a.priority,
-          a.color_override,
-          a.note,
+    let blocks = fetch_blocks_in_range(&state, doctor_employee_id, start_ts, end_ts, None, None).await?;
+    Ok(Json(ApiOk { data: blocks }))
+}
 
-          p.patient_id,
-          p.first_name AS p_first,
-          p.last_name  AS p_last,
-          p.register_number AS p_reg,
+/* ============================================================
+   GET /appointments/day
+   ============================================================ */
 
-          d.employee_id AS d_id,
-          d.employee_display_number AS d_no,
-          d.first_name AS d_first,
-          d.last_name  AS d_last,
+pub async fn get_appointments_day(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Query(q): Query<DayQuery>,
+) -> Result<Json<ApiOk<Vec<AppointmentBlockDto>>>, ApiError> {
+    let date = NaiveDate::parse_from_str(q.date.trim(), "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("VALIDATION_ERROR", "date must be YYYY-MM-DD".into()))?;
 
-          api.service_id AS svc_id,
-          api.qty AS svc_qty,
-          sc.display_name AS svc_name,
-          sc.display_number AS svc_no
+    let requested = ensure_view_doctor_scope(&auth, q.doctor_employee_id)?;
+    let doctor_employee_id = match requested {
+        Some(id) => id,
+        None => {
+            if is_doctor(&auth) {
+                resolve_doctor_employee_id_by_user_id(&state, auth.user_id).await?
+            } else {
+                return Err(ApiError::BadRequest(
+                    "VALIDATION_ERROR",
+                    "doctor_employee_id is required for non-doctor users".into(),
+                ));
+            }
+        }
+    };
 
-        FROM appointment a
-        JOIN patient p ON p.patient_id = a.patient_id
-        JOIN employee d ON d.employee_id = a.doctor_employee_id
-        LEFT JOIN appointment_plan_item api ON api.appointment_id = a.appointment_id
-        LEFT JOIN service_catalog sc ON sc.service_id = api.service_id
+    let start_ts =
+        DateTime::<Utc>::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).unwrap(), Utc);
+    let end_ts = start_ts + chrono::Duration::days(1);
 
-        WHERE a.doctor_employee_id = $1
-          AND a.start_at >= $2
-          AND a.start_at <  $3
-
-        ORDER BY a.start_at ASC, sc.display_number ASC
-        "#,
-    )
-    .bind(doctor_employee_id)
-    .bind(start_ts)
-    .bind(end_ts)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
-
-    Ok(Json(ApiOk {
-        data: fold_rows_into_blocks(rows)?,
-    }))
+    let blocks = fetch_blocks_in_range(&state, doctor_employee_id, start_ts, end_ts, None, None).await?;
+    Ok(Json(ApiOk { data: blocks }))
 }
 
 /* ============================================================
@@ -283,7 +363,6 @@ pub async fn get_appointments_today(
     Query(q): Query<TodayQuery>,
 ) -> Result<Json<ApiOk<Vec<AppointmentBlockDto>>>, ApiError> {
     let requested = ensure_view_doctor_scope(&auth, q.doctor_employee_id)?;
-
     let doctor_employee_id = match requested {
         Some(id) => id,
         None => {
@@ -298,59 +377,64 @@ pub async fn get_appointments_today(
         }
     };
 
-    let start = chrono::Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
-    let start_ts = DateTime::<Utc>::from_naive_utc_and_offset(start, Utc);
+    let today = chrono::Utc::now().date_naive();
+    let start_ts =
+        DateTime::<Utc>::from_naive_utc_and_offset(today.and_hms_opt(0, 0, 0).unwrap(), Utc);
     let end_ts = start_ts + chrono::Duration::days(1);
 
-    let rows = sqlx::query(
-        r#"
-        SELECT
-          a.appointment_id,
-          a.start_at,
-          a.end_at,
-          a.status,
-          a.priority,
-          a.color_override,
-          a.note,
+    let blocks = fetch_blocks_in_range(&state, doctor_employee_id, start_ts, end_ts, None, None).await?;
+    Ok(Json(ApiOk { data: blocks }))
+}
 
-          p.patient_id,
-          p.first_name AS p_first,
-          p.last_name  AS p_last,
-          p.register_number AS p_reg,
+/* ============================================================
+   GET /appointments/overdue
+   ============================================================ */
 
-          d.employee_id AS d_id,
-          d.employee_display_number AS d_no,
-          d.first_name AS d_first,
-          d.last_name  AS d_last,
+pub async fn get_appointments_overdue(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Query(q): Query<OverdueQuery>,
+) -> Result<Json<ApiOk<Vec<AppointmentBlockDto>>>, ApiError> {
+    let within_days = q.within_days.unwrap_or(30);
+    if !(1..=365).contains(&within_days) {
+        return Err(ApiError::BadRequest(
+            "VALIDATION_ERROR",
+            "within_days must be between 1 and 365".into(),
+        ));
+    }
 
-          api.service_id AS svc_id,
-          api.qty AS svc_qty,
-          sc.display_name AS svc_name,
-          sc.display_number AS svc_no
+    let requested = ensure_view_doctor_scope(&auth, q.doctor_employee_id)?;
+    let doctor_employee_id = match requested {
+        Some(id) => id,
+        None => {
+            if is_doctor(&auth) {
+                resolve_doctor_employee_id_by_user_id(&state, auth.user_id).await?
+            } else {
+                return Err(ApiError::BadRequest(
+                    "VALIDATION_ERROR",
+                    "doctor_employee_id is required for non-doctor users".into(),
+                ));
+            }
+        }
+    };
 
-        FROM appointment a
-        JOIN patient p ON p.patient_id = a.patient_id
-        JOIN employee d ON d.employee_id = a.doctor_employee_id
-        LEFT JOIN appointment_plan_item api ON api.appointment_id = a.appointment_id
-        LEFT JOIN service_catalog sc ON sc.service_id = api.service_id
+    let now = chrono::Utc::now();
+    let start_ts = now - chrono::Duration::days(within_days);
+    let end_ts = now;
 
-        WHERE a.doctor_employee_id = $1
-          AND a.start_at >= $2
-          AND a.start_at <  $3
-
-        ORDER BY a.start_at ASC, sc.display_number ASC
-        "#,
+    // overdue definition (Phase 1):
+    // status = 0 (scheduled) and start_at < now
+    let blocks = fetch_blocks_in_range(
+        &state,
+        doctor_employee_id,
+        start_ts,
+        end_ts,
+        Some("a.status = 0"),
+        None,
     )
-    .bind(doctor_employee_id)
-    .bind(start_ts)
-    .bind(end_ts)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
+    .await?;
 
-    Ok(Json(ApiOk {
-        data: fold_rows_into_blocks(rows)?,
-    }))
+    Ok(Json(ApiOk { data: blocks }))
 }
 
 /* ============================================================
@@ -362,8 +446,6 @@ pub async fn get_appointment(
     auth: AuthContext,
     Path(appointment_id): Path<Uuid>,
 ) -> Result<Json<ApiOk<AppointmentBlockDto>>, ApiError> {
-    // Authorization: doctors can only view their own appointment
-    // admin/manager/receptionist can view any.
     let rows = sqlx::query(
         r#"
         SELECT
@@ -374,6 +456,9 @@ pub async fn get_appointment(
           a.priority,
           a.color_override,
           a.note,
+          a.source,
+          a.confirmed_at,
+          a.reminder_sent_at,
 
           p.patient_id,
           p.first_name AS p_first,
@@ -397,7 +482,6 @@ pub async fn get_appointment(
         LEFT JOIN service_catalog sc ON sc.service_id = api.service_id
 
         WHERE a.appointment_id = $1
-
         ORDER BY sc.display_number ASC
         "#,
     )
@@ -410,8 +494,8 @@ pub async fn get_appointment(
         return Err(ApiError::BadRequest("NOT_FOUND", "appointment not found".into()));
     }
 
-    let blocks = fold_rows_into_blocks(rows)?;
-    let block = blocks.into_iter().next().unwrap();
+    let mut blocks = fold_rows_into_blocks(rows)?;
+    let block = blocks.remove(0);
 
     if is_doctor(&auth) {
         let my_emp = resolve_doctor_employee_id_by_user_id(&state, auth.user_id).await?;
@@ -442,6 +526,9 @@ pub struct CreateAppointmentRequest {
     pub priority: Option<i16>, // 0 normal, 1 asap
     pub is_new_patient: Option<bool>,
     pub planned_items: Option<Vec<CreatePlanItem>>,
+
+    // Phase-1 add-on (migration 014)
+    pub source: Option<String>, // "SCHEDULED" | "WALKIN" | "WAITLIST"
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,6 +536,18 @@ pub struct CreatePlanItem {
     pub service_id: Uuid,
     pub qty: Option<i32>,
     pub note: Option<String>,
+}
+
+fn normalize_source(s: Option<String>) -> Result<String, ApiError> {
+    let v = s.unwrap_or_else(|| "SCHEDULED".to_string());
+    let up = v.trim().to_uppercase();
+    match up.as_str() {
+        "SCHEDULED" | "WALKIN" | "WAITLIST" => Ok(up),
+        _ => Err(ApiError::BadRequest(
+            "VALIDATION_ERROR",
+            "source must be SCHEDULED, WALKIN, or WAITLIST".into(),
+        )),
+    }
 }
 
 pub async fn create_appointment(
@@ -465,6 +564,8 @@ pub async fn create_appointment(
     if priority != 0 && priority != 1 {
         return Err(ApiError::BadRequest("VALIDATION_ERROR", "priority must be 0 or 1".into()));
     }
+
+    let source = normalize_source(req.source)?;
 
     let mut tx = state
         .db
@@ -485,10 +586,11 @@ pub async fn create_appointment(
           is_new_patient,
           priority,
           note,
+          source,
           created_by_user_id,
           updated_by_user_id
         )
-        VALUES ($1,$2,$3,$4,$5,$6, 0, $7, $8, $9, $10, $10)
+        VALUES ($1,$2,$3,$4,$5,$6, 0, $7, $8, $9, $10, $11, $11)
         RETURNING appointment_id
         "#,
     )
@@ -501,6 +603,7 @@ pub async fn create_appointment(
     .bind(req.is_new_patient.unwrap_or(false))
     .bind(priority)
     .bind(req.note)
+    .bind(source)
     .bind(auth.user_id)
     .fetch_one(&mut *tx)
     .await
@@ -510,7 +613,6 @@ pub async fn create_appointment(
         .try_get("appointment_id")
         .map_err(|e| ApiError::Internal(format!("row decode error: {e}")))?;
 
-    // planned items
     if let Some(items) = req.planned_items {
         for it in items {
             let qty = it.qty.unwrap_or(1);
@@ -537,7 +639,6 @@ pub async fn create_appointment(
         .await
         .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
 
-    // return detail
     get_appointment(State(state), auth, Path(appointment_id)).await
 }
 
@@ -555,6 +656,11 @@ pub struct PatchAppointmentRequest {
     pub receptionist_employee_id: Option<Option<Uuid>>,
     pub note: Option<Option<String>>,
     pub color_override: Option<Option<i32>>,
+
+    // Phase-1 add-ons
+    pub source: Option<String>,
+    pub confirmed_at: Option<Option<DateTime<Utc>>>,
+    pub reminder_sent_at: Option<Option<DateTime<Utc>>>,
 }
 
 pub async fn patch_appointment(
@@ -565,7 +671,6 @@ pub async fn patch_appointment(
 ) -> Result<Json<ApiOk<AppointmentBlockDto>>, ApiError> {
     ensure_manage(&auth)?;
 
-    // status enum in your migration: [0..5]
     if let Some(s) = req.status {
         if !(0..=5).contains(&s) {
             return Err(ApiError::BadRequest("VALIDATION_ERROR", "invalid status".into()));
@@ -577,7 +682,12 @@ pub async fn patch_appointment(
         }
     }
 
-    // We update with COALESCE logic; but for "nullable set to null", we used Option<Option<T>>
+    let source = if req.source.is_some() {
+        Some(normalize_source(req.source)?)
+    } else {
+        None
+    };
+
     let row = sqlx::query(
         r#"
         UPDATE appointment
@@ -590,8 +700,11 @@ pub async fn patch_appointment(
           receptionist_employee_id = COALESCE($7, receptionist_employee_id),
           note           = COALESCE($8, note),
           color_override = COALESCE($9, color_override),
+          source         = COALESCE($10, source),
+          confirmed_at       = COALESCE($11, confirmed_at),
+          reminder_sent_at   = COALESCE($12, reminder_sent_at),
           updated_at = now(),
-          updated_by_user_id = $10
+          updated_by_user_id = $13
         WHERE appointment_id = $1
         RETURNING appointment_id, start_at, end_at
         "#,
@@ -605,6 +718,9 @@ pub async fn patch_appointment(
     .bind(req.receptionist_employee_id.unwrap_or(None))
     .bind(req.note.unwrap_or(None))
     .bind(req.color_override.unwrap_or(None))
+    .bind(source)
+    .bind(req.confirmed_at.unwrap_or(None))
+    .bind(req.reminder_sent_at.unwrap_or(None))
     .bind(auth.user_id)
     .fetch_optional(&state.db)
     .await
@@ -614,8 +730,12 @@ pub async fn patch_appointment(
         return Err(ApiError::BadRequest("NOT_FOUND", "appointment not found".into()));
     };
 
-    let start_at: DateTime<Utc> = row.try_get("start_at").map_err(|e| ApiError::Internal(format!("{e}")))?;
-    let end_at: DateTime<Utc> = row.try_get("end_at").map_err(|e| ApiError::Internal(format!("{e}")))?;
+    let start_at: DateTime<Utc> = row
+        .try_get("start_at")
+        .map_err(|e| ApiError::Internal(format!("{e}")))?;
+    let end_at: DateTime<Utc> = row
+        .try_get("end_at")
+        .map_err(|e| ApiError::Internal(format!("{e}")))?;
     if end_at <= start_at {
         return Err(ApiError::BadRequest("VALIDATION_ERROR", "end_at must be > start_at".into()));
     }
@@ -703,6 +823,61 @@ pub async fn mark_dismissed(
 }
 
 /* ============================================================
+   POST /appointments/{id}/confirm
+   POST /appointments/{id}/reminder_sent
+   ============================================================ */
+
+pub async fn mark_confirmed(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(appointment_id): Path<Uuid>,
+) -> Result<Json<ApiOk<AppointmentBlockDto>>, ApiError> {
+    ensure_manage(&auth)?;
+
+    sqlx::query(
+        r#"
+        UPDATE appointment
+        SET confirmed_at = COALESCE(confirmed_at, now()),
+            updated_at = now(),
+            updated_by_user_id = $2
+        WHERE appointment_id = $1
+        "#,
+    )
+    .bind(appointment_id)
+    .bind(auth.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::BadRequest("APPOINTMENT_UPDATE_FAILED", format!("{e}")))?;
+
+    get_appointment(State(state), auth, Path(appointment_id)).await
+}
+
+pub async fn mark_reminder_sent(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(appointment_id): Path<Uuid>,
+) -> Result<Json<ApiOk<AppointmentBlockDto>>, ApiError> {
+    ensure_manage(&auth)?;
+
+    sqlx::query(
+        r#"
+        UPDATE appointment
+        SET reminder_sent_at = COALESCE(reminder_sent_at, now()),
+            updated_at = now(),
+            updated_by_user_id = $2
+        WHERE appointment_id = $1
+        "#,
+    )
+    .bind(appointment_id)
+    .bind(auth.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::BadRequest("APPOINTMENT_UPDATE_FAILED", format!("{e}")))?;
+
+    get_appointment(State(state), auth, Path(appointment_id)).await
+}
+
+/* ============================================================
    PUT /appointments/{id}/plan_items  (replace all)
    ============================================================ */
 
@@ -725,14 +900,12 @@ pub async fn put_plan_items(
         .await
         .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
 
-    // delete old
     sqlx::query(r#"DELETE FROM appointment_plan_item WHERE appointment_id = $1"#)
         .bind(appointment_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
 
-    // insert new
     for it in req.items {
         let qty = it.qty.unwrap_or(1);
         if qty <= 0 {
@@ -753,7 +926,6 @@ pub async fn put_plan_items(
         .map_err(|e| ApiError::BadRequest("PLAN_ITEM_CREATE_FAILED", format!("{e}")))?;
     }
 
-    // touch appointment updated_at
     sqlx::query(
         r#"
         UPDATE appointment
@@ -778,10 +950,11 @@ pub async fn put_plan_items(
    Helper: fold joined rows into appointment blocks
    ============================================================ */
 
-fn fold_rows_into_blocks(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<AppointmentBlockDto>, ApiError> {
+fn fold_rows_into_blocks(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<Vec<AppointmentBlockDto>, ApiError> {
     use std::collections::BTreeMap;
 
-    // appointment_id -> dto
     let mut map: BTreeMap<Uuid, AppointmentBlockDto> = BTreeMap::new();
 
     for r in rows {
@@ -793,10 +966,14 @@ fn fold_rows_into_blocks(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Appoint
         let color_override: Option<i32> = r.try_get("color_override").map_err(internal_row)?;
         let note: Option<String> = r.try_get("note").map_err(internal_row)?;
 
+        let source: String = r.try_get("source").unwrap_or_else(|_| "SCHEDULED".into());
+        let confirmed_at: Option<DateTime<Utc>> = r.try_get("confirmed_at").ok();
+        let reminder_sent_at: Option<DateTime<Utc>> = r.try_get("reminder_sent_at").ok();
+
         let p_id: Uuid = r.try_get("patient_id").map_err(internal_row)?;
         let p_first: String = r.try_get("p_first").map_err(internal_row)?;
         let p_last: String = r.try_get("p_last").map_err(internal_row)?;
-        let p_reg: Option<i64> = r.try_get("p_reg").ok(); // register_number might be numeric or null
+        let p_reg: Option<i64> = r.try_get("p_reg").ok();
 
         let d_id: Uuid = r.try_get("d_id").map_err(internal_row)?;
         let d_no: i64 = r.try_get("d_no").map_err(internal_row)?;
@@ -811,6 +988,9 @@ fn fold_rows_into_blocks(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Appoint
             priority,
             color_override,
             note: note.clone(),
+            source: source.clone(),
+            confirmed_at,
+            reminder_sent_at,
             patient: PersonBrief {
                 id: p_id,
                 display: format!("{p_first} {p_last}"),
@@ -825,7 +1005,6 @@ fn fold_rows_into_blocks(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Appoint
             planned_summary: String::new(),
         });
 
-        // collect planned item if exists
         let svc_id: Option<Uuid> = r.try_get("svc_id").ok();
         if let Some(service_id) = svc_id {
             let qty: i32 = r.try_get("svc_qty").unwrap_or(1);
@@ -838,12 +1017,10 @@ fn fold_rows_into_blocks(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Appoint
         }
     }
 
-    // build planned_summary (e.g. "Cleaning + X-Ray")
     for v in map.values_mut() {
         if v.planned_items.is_empty() {
             v.planned_summary = "(no planned items)".into();
         } else {
-            // expand qty into repeated labels if qty>1 (optional)
             let mut parts: Vec<String> = vec![];
             for it in &v.planned_items {
                 if it.qty <= 1 {

@@ -9,6 +9,7 @@ pub mod patient_routes;
 pub mod user_routes;
 pub mod clinic_routes;
 pub mod appointment_routes;
+pub mod task_routes;
 // pub mod report_routes; maybe later
 
 
@@ -21,6 +22,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1", patient_comm_routes::router())
         .nest("/api/v1", patient_routes::router())
         .nest("/api/v1", appointment_routes::router()) //fixed here
+        .nest("/api/v1", task_routes::router())
         .merge(home_routes::router())
         .with_state(state)
 }
