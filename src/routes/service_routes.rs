@@ -8,11 +8,11 @@ use crate::{
     models::{AppState, ServiceCatalogRow},
 };
 
-pub fn router() -> Router<AppState> {
-    Router::new().route("/", get(list_services))
-}
+    pub fn router() -> Router<AppState> {
+        Router::new().route("/", get(list_services))
+    }
 
-pub async fn list_services(
+pub async fn list_services( 
     State(state): State<AppState>,
     _auth: AuthContext,
 ) -> Result<Json<Vec<ServiceCatalogRow>>, ApiError> {

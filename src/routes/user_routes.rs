@@ -355,3 +355,39 @@ pub async fn enable_user(
         data: OkData { ok: true },
     }))
 }
+
+
+// In src/routes/user_routes.rs (at the bottom)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // use crate::error::ApiError;
+    
+    #[test]
+    fn test_validate_role_bounds() {
+        // Valid roles should pass
+        assert!(validate_role(0).is_ok());
+        assert!(validate_role(2).is_ok());
+        assert!(validate_role(4).is_ok());
+        
+        // Invalid roles should fail
+        assert!(validate_role(-1).is_err());
+        assert!(validate_role(5).is_err());
+        assert!(validate_role(100).is_err());
+    }
+    
+    #[test]
+    fn test_validate_username() {
+        assert!(validate_username("alice").is_ok());
+        assert!(validate_username("al").is_err()); // Too short
+        assert!(validate_username("").is_err());
+        assert!(validate_username("  ").is_err()); // Only whitespace
+    }
+    
+    #[test]
+    fn test_validate_password() {
+        assert!(validate_password("password123").is_ok());
+        assert!(validate_password("short").is_err()); // Too short
+        assert!(validate_password("").is_err());
+    }
+}
